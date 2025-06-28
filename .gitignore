@@ -1,0 +1,11 @@
+# Ignore large data files
+data/*.db
+data/*.json
+data/*.csv
+
+# Node modules (if you have)
+node_modules/
+
+# Build output
+.next/
+dist/
