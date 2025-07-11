@@ -9,3 +9,26 @@ node_modules/
 # Build output
 .next/
 dist/
+
+# Ignore environment files
+.env
+*.env
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+env/
+venv/
+ENV/
+.venv/
+
+# IDE folders
+.vscode/
+.idea/
+
+# macOS files
+.DS_Store
