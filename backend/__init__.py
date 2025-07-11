@@ -1,22 +1,33 @@
-# FILE: EncarScraper/backend/__init__.py
+# FILE: backend/__init__.py
+
 from flask import Flask
 from flask_cors import CORS
 from .config import Config
-from .models.car import db
-from .api.listings import listings_bp
+
+# Import the db object from your models package
+from .models import db
 
 def create_app(config_class=Config):
     """
-    The Flask Application Factory.
+    Application Factory Function.
+    This pattern prevents circular imports by configuring the app within the function.
     """
     app = Flask(__name__)
     app.config.from_object(config_class)
     
-    # Initialize extensions
-    CORS(app)  # Enable Cross-Origin Resource Sharing
-    db.init_app(app) # Connect the SQLAlchemy instance to the app
+    # Enable CORS for the entire app
+    CORS(app)
     
-    # Register Blueprints (your API routes)
-    app.register_blueprint(listings_bp)
-    
+    # Connect the db instance to the app
+    db.init_app(app)
+
+    # --- CRITICAL FIX ---
+    # Import blueprints *inside* the function. This is the key to breaking the import cycle.
+    from .api.listings import listings_bp
+    app.register_blueprint(listings_bp, url_prefix='/api')
+
+    @app.route('/test')
+    def test_route():
+        return "Backend is running!"
+
     return app

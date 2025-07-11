@@ -194,7 +194,7 @@ FUEL_TRANSLATIONS = {
     "전기": "Elektrik",
     "LPG": "LPG",
     "CNG": "CNG",
-    "가스": "gas",
+    "가스": "Gas",
     "플러그인 Hybrid": "Plugin Hybrid",
 }
 
@@ -1722,6 +1722,15 @@ SELLER_COMMENT_TRANSLATIONS = {
     "사고차": "Makina e aksidentuar",
     "정비이력": "Historia e mirëmbajtjes",
     "차량상태": "Gjendja e automjetit",
+}
+
+OPTIONS_TRANSLATIONS = {
+    # After a run, you can populate this from translations_master.json
+    # "선루프": "Sunroof",
+}
+
+BODY_TYPE_TRANSLATIONS = {
+    # "세단": "Sedan",
 }
 
 def save_new_translations_to_file(new_translations: dict):

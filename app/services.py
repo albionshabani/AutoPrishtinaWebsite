@@ -1,4 +1,5 @@
 # FILE: EncarScraper/app/services.py
+# UPDATED for Robust Two-Stage Pipeline
 
 import httpx
 import asyncio
@@ -9,16 +10,17 @@ import json
 from typing import Optional, Dict
 
 from deep_translator import GoogleTranslator
-from .config import DATA_DIR, TRANSLATION_MASTER_FILE, DISCORD_WEBHOOK_URL, DISCORD_MESSAGE_ID_FILE
+from .config import *
 
 logger = logging.getLogger("encar_services")
 
-# (The rest of the file is the same as the previous correct version)
 def save_new_translations_to_master_file(new_translations: dict):
     if not any(new_translations.values()): return
     master_translations = {}
     if os.path.exists(TRANSLATION_MASTER_FILE):
-        with open(TRANSLATION_MASTER_FILE, 'r', encoding='utf-8') as f: master_translations = json.load(f)
+        with open(TRANSLATION_MASTER_FILE, 'r', encoding='utf-8') as f:
+            try: master_translations = json.load(f)
+            except json.JSONDecodeError: logger.error(f"Could not decode master translation file: {TRANSLATION_MASTER_FILE}")
     for category, terms in new_translations.items():
         if category not in master_translations: master_translations[category] = {}
         master_translations[category].update(terms)
@@ -27,87 +29,126 @@ def save_new_translations_to_master_file(new_translations: dict):
     logger.info(f"Updated master translation file: {TRANSLATION_MASTER_FILE}")
 
 class ApiClient:
-    def __init__(self, client: httpx.AsyncClient): self.client = client
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
     async def fetch_json_with_retries(self, url: str, params: Optional[Dict] = None, retries: int = 3, delay: int = 2) -> Optional[Dict]:
         last_exception = None
         for attempt in range(retries):
             try:
-                response = await self.client.get(url, params=params, timeout=30); response.raise_for_status(); return response.json()
+                response = await self.client.get(url, params=params, timeout=30)
+                response.raise_for_status()
+                return response.json()
             except httpx.HTTPStatusError as e:
-                if e.response.status_code in [403, 407]: logger.error(f"Critical API Error for {e.request.url}: Status {e.response.status_code}.")
-                last_exception = e; break
+                if e.response.status_code in [403, 407, 400]:
+                    logger.error(f"Critical API Error for {e.request.url}: Status {e.response.status_code}. Aborting retries.")
+                    last_exception = e
+                    break
+                last_exception = e
             except (httpx.RequestError, httpx.TimeoutException) as e:
-                logger.warning(f"Network error on attempt {attempt+1}/{retries} for {url}: {e}"); last_exception = e
-            if attempt < retries - 1: await asyncio.sleep(delay * (2 ** attempt))
+                logger.warning(f"Network error on attempt {attempt+1}/{retries} for {url}: {e}")
+                last_exception = e
+            if attempt < retries - 1:
+                await asyncio.sleep(delay * (2 ** attempt))
         return None
 
 class TranslationManager:
     def __init__(self, translation_maps: Dict[str, Dict]):
-        self.translation_maps = translation_maps; self.new_translations = {key: {} for key in self.translation_maps.keys()}
+        self.translation_maps = translation_maps
+        # This dictionary holds only the NEW terms found during this run.
+        self.new_translations = {key: {} for key in self.translation_maps.keys()}
+
     def smart_translate(self, category: str, term: Optional[str]) -> Optional[str]:
-        if not term: return None
-        if term in self.translation_maps.get(category, {}): return self.translation_maps[category][term]
+        """
+        Hybrid translation: Checks local cache first, then falls back to Google Translate API.
+        """
+        if not term:
+            return None
+        
+        # 1. Check local, pre-populated dictionary first for instant speed.
+        if term in self.translation_maps.get(category, {}):
+            return self.translation_maps[category][term]
+        
+        # 2. If not found, fallback to Google Translate.
         try:
+            # This is a network call and will be slower.
             translated_term = GoogleTranslator(source='ko', target='en').translate(term)
             if translated_term:
-                self.new_translations[category][term] = translated_term; self.translation_maps[category][term] = translated_term
+                logger.info(f"Google Translated '{term}' -> '{translated_term}' in category '{category}'")
+                # 3a. Cache in memory for the rest of this run.
+                self.translation_maps.setdefault(category, {})[term] = translated_term
+                # 3b. Add to our 'new_translations' dict to be saved to file later.
+                self.new_translations.setdefault(category, {})[term] = translated_term
                 return translated_term
-        except Exception: pass
+        except Exception as e:
+            logger.warning(f"Google Translate failed for term '{term}': {e}. Returning original.")
+            
+        # 4. If all else fails, return the original Korean term.
         return term
 
 class EurExchangeRateCache:
     def get_rate(self) -> float: return 0.00063
 
 class StatusManager:
-    def __init__(self, webhook_url: str):
-        self.webhook_url = webhook_url; self.message_id = self._load_message_id(); self.start_time = time.time(); self.last_update_time = 0; self.client = httpx.Client()
-    def _load_message_id(self) -> Optional[str]:
-        if os.path.exists(DISCORD_MESSAGE_ID_FILE):
-            with open(DISCORD_MESSAGE_ID_FILE, 'r') as f: return f.read().strip()
-    def _save_message_id(self, message_id: str):
-        with open(DISCORD_MESSAGE_ID_FILE, 'w') as f: f.write(message_id)
-    def send_or_edit_message(self, content: str, is_final: bool = False):
-        if not self.webhook_url or "YOUR_WEBHOOK" in self.webhook_url: return
-        url = f"{self.webhook_url}/messages/{self.message_id}" if self.message_id else f"{self.webhook_url}?wait=true"
-        method = 'PATCH' if self.message_id else 'POST'
-        try:
-            res = self.client.request(method, url, json={'content': content}, timeout=15); res.raise_for_status()
-            if method == 'POST': self.message_id = res.json()['id']; self._save_message_id(self.message_id)
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404: self.message_id = None; self.send_or_edit_message(content)
-            else: logger.error(f"Discord webhook error: {e.response.status_code} - {e.response.text}")
+    """
+    Manages the status of the enrichment process by writing it to a JSON file.
+    The Discord bot will read this file to report progress.
+    """
+    def __init__(self):
+        self.status_file = ENRICHMENT_STATUS_FILE
+        self.start_time = time.time()
+        self.last_update_time = 0
 
-    def update_discovery_progress(self, current_chunk: int, total_chunks: int, found_so_far: int):
-        now = time.time()
-        if now - self.last_update_time < 2 and current_chunk < total_chunks: return
-        progress = (current_chunk / total_chunks * 100) if total_chunks > 0 else 0
-        msg = (f"⚙️ **Phase 1: Discovering...**\n```"
-               f"Scanning Mileage Range: {current_chunk} / {total_chunks} ({progress:.1f}%)\n"
-               f"Listings Found So Far:  {found_so_far:,}```")
-        self.send_or_edit_message(msg); self.last_update_time = now
-        
+    def _write_status(self, data: dict):
+        """Atomically writes the status dictionary to the file."""
+        temp_file = self.status_file + ".tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(temp_file, self.status_file)
+
+    def initialize(self, total: int):
+        status_data = {
+            "phase": "Enrichment",
+            "status": "Initializing",
+            "processed": 0, "total": total, "failed": 0, "partial_counts": {},
+            "progress": "0.0%", "speed": "N/A", "eta": "N/A"
+        }
+        self._write_status(status_data)
+
     def update_enrich_progress(self, processed: int, total: int, failed: int, partial_counts: Dict):
         now = time.time()
         total_complete = processed + sum(partial_counts.values())
-        if now - self.last_update_time < 5 and total_complete < total: return
-        elapsed = now - self.start_time; speed = total_complete / elapsed if elapsed > 0 else 0
+        if now - self.last_update_time < 5 and total_complete < total:
+            return
+            
+        elapsed = now - self.start_time
+        speed = total_complete / elapsed if elapsed > 0 else 0
         progress = (total_complete / total * 100) if total > 0 else 0
         eta = f"{int((total - total_complete) / speed // 3600)}h {int(((total - total_complete) / speed % 3600) // 60)}m" if speed > 0 else "N/A"
-        s = f"S: {processed:,}"; f = f"F: {failed:,}"; ni = f"NI: {partial_counts.get('no_inspection', 0):,}"; nr = f"NR: {partial_counts.get('no_record', 0):,}"; nd = f"ND: {partial_counts.get('no_diagnosis', 0):,}"
-        msg = (f"⚙️ **Phase 2: Enriching...**\n```"
-               f"Progress: {total_complete:,} / {total:,} ({progress:.1f}%) | Speed: {speed:.1f} cars/sec | ETA: {eta}\n"
-               f"--------------------------------------------------\n"
-               f"{s} | {f} | {ni} | {nr} | {nd}```")
-        self.send_or_edit_message(msg); self.last_update_time = now
+        
+        status_data = {
+            "phase": "Enrichment",
+            "status": "Running",
+            "processed": processed,
+            "total": total,
+            "failed": failed,
+            "partial_counts": partial_counts,
+            "progress": f"{progress:.1f}%",
+            "speed": f"{speed:.1f} cars/sec",
+            "eta": eta
+        }
+        self._write_status(status_data)
+        self.last_update_time = now
 
     def send_final_message(self, processed: int, failed: int, partial_counts: Dict, status: str):
-        emoji, title = {"complete": ("✅", "Run Complete"), "stopped": ("🛑", "Run Stopped"), "crashed": ("💥", "Run Crashed")}.get(status, ("💥", "Run Failed"))
         elapsed = time.time() - self.start_time
-        partial_str = "\n".join([f"- No {k.replace('no_', '')}: {v:,}" for k,v in partial_counts.items() if v > 0])
-        partial_section = f"\nPartially Processed:\n{partial_str}" if any(partial_counts.values()) else ""
-        msg = (f"{emoji} **{title}**\n```"
-               f"Successful: {processed:,}\n"
-               f"Failed:     {failed:,}{partial_section}\n\n"
-               f"Total Duration:  {int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m```")
-        self.send_or_edit_message(msg, is_final=True)
-        if os.path.exists(DISCORD_MESSAGE_ID_FILE): os.remove(DISCORD_MESSAGE_ID_FILE)
+        duration = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m"
+        final_status = {
+            "phase": "Enrichment",
+            "status": status.capitalize(),
+            "processed": processed,
+            "failed": failed,
+            "partial_counts": partial_counts,
+            "duration": duration
+        }
+        self._write_status(final_status)
+        logger.info(f"Final enrichment status written to file: {status}")
